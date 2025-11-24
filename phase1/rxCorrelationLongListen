@@ -1,0 +1,158 @@
+%% ==========================
+% PREPARE PREAMBLE REFERENCE
+%% ==========================
+Fs = 500e3;
+Rsym = 100e3;
+sps = Fs/Rsym;
+
+% Regenerate TX preamble
+pn = comm.PNSequence( ...
+    'Polynomial',[7 0], ...
+    'InitialConditions',ones(1,7), ...
+    'SamplesPerFrame',127);
+
+preamble_bits = pn();
+if mod(length(preamble_bits),2) ~= 0
+    preamble_bits = [preamble_bits; 0];
+end
+
+qpskMod = comm.QPSKModulator('BitInput',true);
+rrc = comm.RaisedCosineTransmitFilter( ...
+    'RolloffFactor', 0.35, ...
+    'FilterSpanInSymbols', 8, ...
+    'OutputSamplesPerSymbol', sps);
+
+preamble_sym = qpskMod(preamble_bits);
+preamble_ref = rrc(preamble_sym);
+preamble_ref = preamble_ref / max(abs(preamble_ref));
+
+Np = length(preamble_ref);
+fprintf("Preamble length (samples): %d\n", Np);
+
+%% ==========================
+% rxBufferS (NOISE + CORRELATION)
+%% ==========================
+noiseSeconds = 0.5;
+noiseBufLen = round(noiseSeconds * Fs);
+
+preambleBuf = complex(zeros(200000,1));      % sliding window
+noiseBuf    = complex(zeros(noiseBufLen,1)); % 0.5 s noise
+
+detect = false;
+
+%% ==========================
+% SDR CONFIG
+%% ==========================
+centerFrequency = 915e6;
+masterClock = 30e6;
+decim = 60;
+gain = 61;
+
+rxObj = comm.SDRuReceiver( ...
+    'Platform', 'B210', ...
+    'SerialNum', '34C78FD', ...
+    'MasterClockRate', masterClock, ...
+    'DecimationFactor', decim, ...
+    'CenterFrequency', centerFrequency, ...
+    'ChannelMapping', 1, ...
+    'Gain', gain, ...
+    'OutputDataType', 'double');
+
+sampleRate = rxObj.MasterClockRate / rxObj.DecimationFactor;
+fprintf('Sample rate = %.1f kHz\n', sampleRate/1e3);
+
+disp("Listening for preamble...");
+
+%% ==========================
+% PREAMBLE DETECTION LOOP
+%% ==========================
+% 4× std gives good separation
+threshold = 5;
+
+fprintf("Threshold = %.3f\n", threshold);
+
+neededPost = 40000;   % 40k samples after preamble
+rxBuffer = complex([]);
+
+while true
+    rxWin = rxObj();             % get new samples from SDR
+    rxBuffer = [rxBuffer ; rxWin];   % append to rolling rxBuffer
+
+    % keep rxBuffer size reasonable
+    maxrxBuffer = 200000;          % increase rxBuffer for long packets
+    if length(rxBuffer) > maxrxBuffer
+        rxBuffer = rxBuffer(end-maxrxBuffer+1:end);
+    end
+
+    if length(rxBuffer) < Np + neededPost
+        continue;   % wait for more samples
+    end
+
+    % correlate to find preamble
+    [c, lags] = xcorr(rxBuffer, preamble_ref);
+    [~, idx] = max(abs(c));
+    lag = lags(idx);
+
+    if abs(c(idx)) > threshold
+        fprintf("Preamble detected!\n");
+
+        preambleStart = lag + 1;
+
+        % WAIT until rxBuffer has enough samples for full extraction
+        while length(rxBuffer) < preambleStart + Np + neededPost - 1
+            [rxExtra, len, ~] = rxObj();
+            rxBuffer = [rxBuffer ; rxExtra];
+        end
+
+        % now safe to extract 40k samples post-preamble
+        dataStart = preambleStart + Np;
+        dataEnd   = dataStart + neededPost - 1;
+        rx = rxBuffer(dataStart:dataEnd);
+
+        % CFO correction
+        coarseFreqComp = comm.CoarseFrequencyCompensator( ...
+            'Modulation', 'QPSK', ...
+            'FrequencyResolution', 1, ...   % Hz resolution
+            'SampleRate', Fs ...            % Fs, NOT Fs*sps
+        );
+        cfo_corrected_rx = coarseFreqComp(rx);
+
+        % Save CSVs
+        writematrix([real(rx) imag(rx)], 'rx_raw.csv');
+        writematrix([real(cfo_corrected_rx) imag(cfo_corrected_rx)], 'rx_after_cfo_corrected.csv');
+
+        fprintf("Saved 40000 samples after preamble.\n");
+        break;
+    end
+end
+
+release(rxObj);
+
+disp("Done.");
+
+[c_final, lags_final] = xcorr(rxBuffer, preamble_ref);
+
+figure;
+
+subplot(2,1,1);
+plot(lags_final, abs(c_final));
+title('Final Correlation |rxBuffer ⨂ preamble| (Full)');
+xlabel('Lag (samples)');
+ylabel('Correlation Magnitude');
+grid on;
+
+% zoom near peak
+[~, peakIdx] = max(abs(c_final));
+peakLag = lags_final(peakIdx);
+zoomSpan = 2000;
+
+lagMin = peakLag - zoomSpan;
+lagMax = peakLag + zoomSpan;
+
+subplot(2,1,2);
+idxRange = find(lags_final >= lagMin & lags_final <= lagMax);
+plot(lags_final(idxRange), abs(c_final(idxRange)));
+title('Zoomed Correlation Region Near Detected Preamble');
+xlabel('Lag (samples)');
+ylabel('Correlation Magnitude');
+grid on;
