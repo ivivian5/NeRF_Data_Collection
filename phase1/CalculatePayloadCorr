@@ -1,0 +1,61 @@
+rxDataCSV = readmatrix('rx_after_cfo_corrected.csv');
+%rxDataCSV = readmatrix('rx_after_raw.csv');
+rxIQ = rxDataCSV(:,1) + 1j*rxDataCSV(:,2);
+
+% deterministic payload
+seed = 12345;
+rng(seed, 'twister');
+
+numPayloadSymbols = 4000;     % symbols (matches post-preamble sample length)
+bitsPerSym = 2;               % QPSK
+
+numPayloadBits = numPayloadSymbols * bitsPerSym;
+payload_bits = randi([0 1], numPayloadBits, 1);
+
+
+qpskMod = comm.QPSKModulator('BitInput', true);
+payload_symbols = qpskMod(payload_bits);   % complex baseband symbols
+
+rrc = comm.RaisedCosineTransmitFilter( ...
+    'RolloffFactor', 0.35, ...
+    'FilterSpanInSymbols', 8, ...
+    'OutputSamplesPerSymbol', sps);  % same sps as TX
+
+payload_waveform = rrc(payload_symbols);
+payload_waveform = payload_waveform / max(abs(payload_waveform));  % normalize
+
+%check
+length(payload_waveform)
+length(rxIQ)
+
+rxIQ_trimmed = rxIQ(1:length(payload_waveform));
+
+
+rxNorm = rxIQ_trimmed / norm(rxIQ_trimmed);
+txNorm = payload_waveform / norm(payload_waveform);
+
+[corrVals, lags] = xcorr(rxNorm, txNorm);
+[peakVal, idx] = max(abs(corrVals));
+fprintf("Normalized peak correlation: %.4f\n", peakVal);
+
+% Cross-correlation between received waveform and known payload
+[corrVals, lags] = xcorr(rxIQ_trimmed, payload_waveform);
+corrNorm = abs(corrVals) / (norm(rxIQ_trimmed)*norm(payload_waveform));
+
+
+% find peak correlation
+[peakCorr, idx] = max(corrNorm);
+lagAtPeak = lags(idx);
+
+fprintf('Peak correlation magnitude: %.4f\n', peakCorr);
+fprintf('Lag at peak: %d samples\n', lagAtPeak);
+
+% Optional: plot correlation
+figure;
+plot(lags, abs(corrNorm));
+xlabel('Lag (samples)');
+ylabel('|Correlation|');
+title('Correlation between received waveform and known payload');
+grid on;
+
+t = (0:Lmin-1)/Fs;
