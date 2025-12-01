@@ -1,14 +1,14 @@
 clear all;
 %% ==============================================================================
-%  NeRF2 RECEIVER (Optimized Single Capture)
+%  NeRF2 RECEIVER (5s Offline Processing)
 % ==============================================================================
 
 % 1. REFERENCE AND CONFIG
 Fs = 500e3;
-ChunkSize = 10000; % Set a large, fixed chunk size for reading
-N = 5115; % Calculated length of reference_sig (1024 symbols * 5 sps - 5 samples)
+CaptureTime = 5; % seconds
+TotalSamples = round(Fs * CaptureTime);
 
-% (Code to generate reference_sig remains identical)
+% Generate Reference (Must match TX exactly)
 pn = comm.PNSequence('Polynomial', [10 3 0], 'InitialConditions', ones(1,10), 'SamplesPerFrame', 1023);
 ref_bits = pn();
 if mod(length(ref_bits), 2) ~= 0, ref_bits = [ref_bits; 0]; end
@@ -17,16 +17,18 @@ ref_syms = qpskMod(ref_bits);
 sps = 5;
 rrcTx = comm.RaisedCosineTransmitFilter('RolloffFactor', 0.25, 'FilterSpanInSymbols', 6, 'OutputSamplesPerSymbol', sps);
 reference_sig = rrcTx(ref_syms);
+% Normalize reference for correlation
 reference_sig = reference_sig / max(abs(reference_sig));
-N = length(reference_sig); % Corrected N = 5115
+N = length(reference_sig); % Length of the known sounding packet
 
-% 2. HARDWARE CONFIG (WITH SamplesPerFrame)
+% 2. HARDWARE CONFIG (Single Capture)
+% SamplesPerFrame is set to the total capture size to ensure a single, large read.
 rxObj = comm.SDRuReceiver(...
     'Platform',             'B210', ...
     'SerialNum',            '34C78FD', ...
     'MasterClockRate',      30e6, ...
     'DecimationFactor',     60, ...
-    'SamplesPerFrame',      ChunkSize, ...
+    'SamplesPerFrame',      TotalSamples, ... % <-- Set to 5 seconds worth of samples
     'CenterFrequency',      915e6, ...
     'Gain',                 60, ...
     'ChannelMapping',       [1 2], ...
@@ -35,79 +37,80 @@ rxObj = comm.SDRuReceiver(...
 % 3. PROCESSING OBJECTS
 cfoObj = comm.CoarseFrequencyCompensator('Modulation','QPSK','SampleRate',Fs, 'FrequencyResolution', 50);
 
-disp("Listening for a single packet...");
+disp(['Capturing ', num2str(CaptureTime), ' seconds of data...']);
 figure(1); clf;
 
-rxBuffer = complex(zeros(0, 2));
-minBufferForCheck = N + ChunkSize; % Only correlate when we have enough data to cover one packet + one chunk
+% A. CAPTURE DATA (Single Call)
+% This blocks the code until all samples are received, eliminating overruns.
+[rxBuffer, ~, overrun] = rxObj(); 
 
-while true
-    % A. Receive Data
-    % rxChunk will always be ChunkSize x 2
-    [rxChunk, ~, overrun] = rxObj();
-    if overrun
-        warning('Overrun detected! Increase SamplesPerFrame or reduce processing load.');
-    end
+if overrun, warning('Overrun detected during capture! Try reducing SampleRate or CaptureTime.'); end
+if size(rxBuffer, 1) < TotalSamples, warning('Incomplete capture.'); end
+
+disp('Capture complete. Starting offline processing.');
+
+% 4. OFFLINE PACKET DETECTION (Sliding Normalized Correlation)
+% Use 'coeff' normalization: C(0) = 1 means perfect match.
+[c_norm, lags] = xcorr(rxBuffer(:,1), reference_sig, 'coeff'); 
+[maxVal, idx] = max(abs(c_norm));
+
+% B. THRESHOLD CHECK (Normalized correlation peak)
+% A value near 1.0 is a perfect match. Set a confident threshold, e.g., 0.6.
+normalizedThreshold = 0.6; 
+
+if maxVal > normalizedThreshold
+    lag = lags(idx);
+    startIdx = lag + 1;
     
-    rxBuffer = [rxBuffer; rxChunk];
+    fprintf('✅ Packet detected! Normalized Peak: %.4f at Time: %.3f s\n', ...
+        maxVal, (startIdx / Fs));
     
-    % B. Detection (Correlate only if enough data is present)
-    if size(rxBuffer, 1) >= minBufferForCheck
+    % C. EXTRACT, PROCESS, AND SAVE
+    
+    % Ensure extraction is within bounds
+    if startIdx > 0 && (startIdx + N - 1 <= size(rxBuffer, 1))
         
-        % C. Use a sliding correlation window for efficiency 
-        % Correlate only the most recent 'minBufferForCheck' samples, not the entire historical buffer
-        checkWindow = rxBuffer(end - minBufferForCheck + 1 : end, 1);
-        [c, lags] = xcorr(checkWindow, reference_sig);
+        % Extraction (Both Antennas)
+        packet_ant1 = rxBuffer(startIdx : startIdx + N - 1, 1);
+        packet_ant2 = rxBuffer(startIdx : startIdx + N - 1, 2);
         
-        [maxVal, idx] = max(abs(c));
+        % CFO Correction
+        [~, estCFO] = cfoObj(packet_ant1);
+        t = (0:N-1).' / Fs;
+        cfo_vector = exp(-1i * 2 * pi * estCFO * t);
         
-        % THRESHOLD CHECK
-        if maxVal > 15 
-            
-            % Since we correlated on the checkWindow, we need to map the lag back to the main buffer
-            lagInWindow = lags(idx);
-            startIdx = size(rxBuffer, 1) - minBufferForCheck + 1 + lagInWindow;
-            
-            % D. Extraction and Processing (Only if bounds are safe)
-            if startIdx > 0 && (startIdx + N < size(rxBuffer, 1))
-                
-                packet_ant1 = rxBuffer(startIdx : startIdx + N - 1, 1);
-                packet_ant2 = rxBuffer(startIdx : startIdx + N - 1, 2);
-                
-                % CFO Correction
-                [~, estCFO] = cfoObj(packet_ant1);
-                t = (0:N-1).' / Fs;
-                cfo_vector = exp(-1i * 2 * pi * estCFO * t);
-                
-                clean_ant1 = packet_ant1 .* cfo_vector;
-                clean_ant2 = packet_ant2 .* cfo_vector;
-                
-                % E. VISUALIZATION AND SAVE
-                subplot(2,2,1); plot(lags, abs(c)); title(['Correlation Peak (Max:', num2str(maxVal, '%.2f'), ')']);
-                subplot(2,2,2); plot(abs(clean_ant1)); title('Packet Envelope (Ant 1)');
-                subplot(2,2,3); scatterplot(clean_ant1(1:10:end), 1, 0, 'b.'); title(['Constellation (CFO:', num2str(estCFO, '%.1f'), ' Hz)']);
-                subplot(2,2,4); scatterplot(clean_ant2(1:10:end), 1, 0, 'r.'); title('Constellation (Ant 2)');
-                drawnow;
+        clean_ant1 = packet_ant1 .* cfo_vector;
+        clean_ant2 = packet_ant2 .* cfo_vector;
+        
+        % D. VISUALIZATION
+        subplot(2,2,1); plot(lags, abs(c_norm)); 
+        hold on; plot(lags([1 end]), [normalizedThreshold normalizedThreshold], 'r--'); hold off;
+        title('Normalized Correlation Peak'); xlabel('Lag (Samples)'); ylabel('Magnitude');
+        
+        subplot(2,2,2); plot(abs(clean_ant1)); title('Packet Envelope (Ant 1)');
+        
+        subplot(2,2,3); scatterplot(clean_ant1(1:10:end), 1, 0, 'b.'); 
+        title(['Constellation (CFO:', num2str(estCFO, '%.1f'), ' Hz)']);
+        
+        subplot(2,2,4); scatterplot(clean_ant2(1:10:end), 1, 0, 'r.'); 
+        title('Constellation (Ant 2)');
+        
+        % E. SAVE FINAL DATA
+        final_data.clean_ant1 = clean_ant1;
+        final_data.clean_ant2 = clean_ant2;
+        final_data.cfo = estCFO;
+        
+        save('nerf_single_capture_offline.mat', 'final_data');
+        
+        disp("Data successfully processed and saved to nerf_single_capture_offline.mat");
 
-                final_data.clean_ant1 = clean_ant1;
-                final_data.clean_ant2 = clean_ant2;
-                final_data.cfo = estCFO;
-                
-                save('nerf_single_capture.mat', 'final_data');
-                
-                fprintf("\n✅ First packet captured and saved.\n");
-                
-                % F. TERMINATE SCRIPT
-                break; 
-            end
-        end
-        
-        % G. Aggressively trim the old buffer if no packet was found in the latest chunk
-        % Keep only the last full check window to look for the next chunk's packet
-        rxBuffer = rxBuffer(end - minBufferForCheck + 1 : end, :);
-
+    else
+        fprintf('⚠️ Error: Detected packet index (%d) is too close to the buffer edge.\n', startIdx);
     end
+
+else
+    disp(['❌ Packet not found. Max correlation peak was ', num2str(maxVal, '%.4f'), '.']);
+    
 end
 
 release(rxObj);
-disp("Done.");
