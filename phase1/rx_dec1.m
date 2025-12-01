@@ -51,12 +51,12 @@ disp('Capture complete. Starting offline processing.');
 
 % 4. OFFLINE PACKET DETECTION (Sliding Normalized Correlation)
 % Use 'coeff' normalization: C(0) = 1 means perfect match.
-[c_norm, lags] = xcorr(rxBuffer(:,1), reference_sig, 'coeff'); 
+[c_norm, lags] = xcorr(rxBuffer(:,1), reference_sig); 
 [maxVal, idx] = max(abs(c_norm));
 
 % B. THRESHOLD CHECK (Normalized correlation peak)
 % A value near 1.0 is a perfect match. Set a confident threshold, e.g., 0.6.
-normalizedThreshold = 0.6; 
+normalizedThreshold = 15; 
 
 if maxVal > normalizedThreshold
     lag = lags(idx);
@@ -81,7 +81,6 @@ if maxVal > normalizedThreshold
         
         clean_ant1 = packet_ant1 .* cfo_vector;
         clean_ant2 = packet_ant2 .* cfo_vector;
-        
         % D. VISUALIZATION
         subplot(2,2,1); plot(lags, abs(c_norm)); 
         hold on; plot(lags([1 end]), [normalizedThreshold normalizedThreshold], 'r--'); hold off;
@@ -89,11 +88,12 @@ if maxVal > normalizedThreshold
         
         subplot(2,2,2); plot(abs(clean_ant1)); title('Packet Envelope (Ant 1)');
         
-        subplot(2,2,3); scatterplot(clean_ant1(1:10:end), 1, 0, 'b.'); 
-        title(['Constellation (CFO:', num2str(estCFO, '%.1f'), ' Hz)']);
-        
+        %subplot(2,2,3); scatterplot(clean_ant1(1:10:end), 1, 0, 'b.'); 
+        %title(['Constellation (CFO:', num2str(estCFO, '%.1f'), ' Hz)']);
+
         subplot(2,2,4); scatterplot(clean_ant2(1:10:end), 1, 0, 'r.'); 
         title('Constellation (Ant 2)');
+
         
         % E. SAVE FINAL DATA
         final_data.clean_ant1 = clean_ant1;
