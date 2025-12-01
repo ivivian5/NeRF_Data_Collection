@@ -1,0 +1,120 @@
+clear all;
+
+%% ================================================
+%  CONFIG
+% ================================================
+Fs = 500e3;
+CaptureSec = 5;
+TotalSamples = Fs * CaptureSec;   % 500k * 5 = 2,500,000 samples
+ChunkSize = 10000;
+
+%% ================================================
+%  CREATE REFERENCE SIGNAL
+% ================================================
+pn = comm.PNSequence('Polynomial',[10 3 0],'InitialConditions',ones(1,10),'SamplesPerFrame',1023);
+ref_bits = pn();
+if mod(length(ref_bits),2)~=0, ref_bits=[ref_bits;0]; end
+
+qpskMod = comm.QPSKModulator('BitInput',true,'PhaseOffset',pi/4);
+ref_syms = qpskMod(ref_bits);
+
+sps = 5;
+rrcTx = comm.RaisedCosineTransmitFilter(...
+    'RolloffFactor',0.25,'FilterSpanInSymbols',6,'OutputSamplesPerSymbol',sps);
+
+reference_sig = rrcTx(ref_syms);
+reference_sig = reference_sig / max(abs(reference_sig));
+N = length(reference_sig);   % ~5115 samples
+
+%% ================================================
+%  USRP RX SETUP
+% ================================================
+rxObj = comm.SDRuReceiver(...
+    'Platform','B210',...
+    'SerialNum','34C78FD',...
+    'MasterClockRate',30e6,...
+    'DecimationFactor',60,...
+    'SamplesPerFrame',ChunkSize,...
+    'CenterFrequency',915e6,...
+    'Gain',60,...
+    'ChannelMapping',[1 2],...
+    'OutputDataType','double');
+
+%% ================================================
+%  1. ONE-SHOT 5-SECOND CAPTURE
+% ================================================
+disp("Capturing 5 seconds of raw IQ...");
+
+rxBuffer = complex(zeros(TotalSamples, 2));
+samplesFilled = 0;
+
+while samplesFilled < TotalSamples
+    [rxChunk, ~, overrun] = rxObj();
+    if overrun
+        warning("Overrun occurred.");
+    end
+    
+    toCopy = min(ChunkSize, TotalSamples - samplesFilled);
+    rxBuffer(samplesFilled + 1 : samplesFilled + toCopy, :) = rxChunk(1:toCopy, :);
+    samplesFilled = samplesFilled + toCopy;
+end
+
+disp("Done. Processing capture...");
+
+release(rxObj);
+
+%% ================================================
+%  2. CORRELATION (ONE TIME)
+% ================================================
+sig = rxBuffer(:,1);  % antenna 1 for peak detection
+
+[c, lags] = xcorr(sig, reference_sig);
+[peakVal, idx] = max(abs(c));
+peakLag = lags(idx);
+
+startIdx = peakLag;
+
+fprintf("Peak correlation = %.2f at index %d\n", peakVal, startIdx);
+
+%% ================================================
+%  3. ALIGN + EXTRACT PACKET
+% ================================================
+if startIdx <= 0 || startIdx + N - 1 > length(sig)
+    error("Packet does not fit in capture window. Increase capture length.");
+end
+
+packet_ant1 = rxBuffer(startIdx:startIdx+N-1, 1);
+packet_ant2 = rxBuffer(startIdx:startIdx+N-1, 2);
+
+%% ================================================
+%  4. CFO CORRECTION
+% ================================================
+cfoObj = comm.CoarseFrequencyCompensator(...
+    'Modulation','QPSK','SampleRate',Fs,'FrequencyResolution',50);
+
+[~, estCFO] = cfoObj(packet_ant1);
+
+t = (0:N-1).' / Fs;
+cfo_vector = exp(-1i * 2*pi*estCFO.*t);
+
+clean_ant1 = packet_ant1 .* cfo_vector;
+clean_ant2 = packet_ant2 .* cfo_vector;
+
+%% ================================================
+%  VISUALIZE
+% ================================================
+figure(1); clf;
+subplot(2,2,1); plot(lags, abs(c)); title("Correlation");
+subplot(2,2,2); plot(abs(clean_ant1)); title("Aligned Packet");
+subplot(2,2,3); scatterplot(clean_ant1(1:10:end)); title("Constellation A1");
+subplot(2,2,4); scatterplot(clean_ant2(1:10:end)); title("Constellation A2");
+
+%% SAVE OUTPUT
+final_data.clean_ant1 = clean_ant1;
+final_data.clean_ant2 = clean_ant2;
+final_data.cfo = estCFO;
+final_data.corr_peak = startIdx;
+
+save('nerf_single_5sec_capture.mat','final_data');
+
+disp("Done. One-shot capture completed.");
